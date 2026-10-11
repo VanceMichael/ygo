@@ -86,7 +86,7 @@ func TestUnit_PendingBudget_SkipInWorklistMatchesReference(t *testing.T) {
 		groups = append(groups, []*Item{{ID: ID{Client: ClientID(c)}, Origin: o, Parent: &text.abstractType, Content: NewContentString("x")}})
 	}
 	for _, version := range []int{1, 2} {
-		update := pendingGuardUpdate(source, groups, map[int]bool{0: true}, version)
+		update := pendingGuardUpdate(source, groups, map[int]uint64{0: 1}, version)
 		for _, rem := range []int{0, 1, 2} {
 			b := pendingBudget{initial: StateVector{}, update: update, remaining: rem, v2: version == 2}
 			if want, got := referencePendingBudgetCheck(b, rem), b.check(rem); (want == nil) != (got == nil) {
@@ -124,6 +124,102 @@ func TestUnit_PendingBudget_CursorBombAllocations(t *testing.T) {
 				t.Fatalf("wire=%d allocated=%d", len(update), allocated)
 			}
 		})
+	}
+}
+
+// pendingBombShape builds a short resolvable chain, so both plain scans make
+// progress, followed by m two-struct groups whose heads can never resolve:
+//
+//	cycle:   head k depends on the next group's head, the last on the first
+//	decoy:   heads depend on clocks of client x, whose only group starts
+//	         past a clock gap
+//	skipdep: client x covers every dependency clock only with a skip
+//	dup:     every group is followed by an overlapping group for its client
+func pendingBombShape(version int, shape string, m int) []byte {
+	source := New()
+	defer source.Destroy()
+	text := source.GetText("text")
+	str := func(c ClientID, clock uint64, origin *ID) *Item {
+		item := &Item{ID: ID{Client: c, Clock: clock}, Origin: origin, Content: NewContentString("x")}
+		if origin == nil {
+			item.Parent = &text.abstractType
+		}
+		return item
+	}
+	var groups [][]*Item
+	skips := map[int]uint64{}
+	for c := ClientID(1); c <= 4; c++ {
+		var origin *ID
+		if c < 4 {
+			origin = &ID{Client: c + 1}
+		}
+		groups = append(groups, []*Item{str(c, 0, origin)})
+	}
+	const x = ClientID(1 << 40)
+	gc := func(clock, length uint64) *Item {
+		return &Item{ID: ID{Client: x, Clock: clock}, Content: NewContentDeleted(int(length)), Deleted: true}
+	}
+	switch shape {
+	case "decoy":
+		groups = append(groups, []*Item{gc(5, 1<<30)})
+	case "skipdep":
+		skips[len(groups)] = 1 << 30
+		groups = append(groups, []*Item{gc(0, 1), gc(1+1<<30, 1)})
+	}
+	for i := 0; i < m; i++ {
+		c := ClientID(5 + i)
+		var dep ID
+		switch shape {
+		case "cycle":
+			dep = ID{Client: ClientID(5 + (i+1)%m)}
+		case "decoy":
+			dep = ID{Client: x, Clock: uint64(10 + i)}
+		case "skipdep":
+			dep = ID{Client: x, Clock: uint64(2 + i)}
+		case "dup":
+			dep = ID{Client: 1 << 41}
+		}
+		groups = append(groups, []*Item{str(c, 0, &dep), str(c, 1, &ID{Client: c})})
+		if shape == "dup" {
+			groups = append(groups, []*Item{str(c, 0, &dep)})
+		}
+	}
+	return pendingGuardUpdate(source, groups, skips, version)
+}
+
+// Unresolvable heads whose dependencies are present in the update must not
+// retain a decoder copy per group: preflight stays within a small multiple of
+// the wire size, plus V2's normal column copy. Only a cycle needs a record
+// per group; the others are ruled out by what each client can reach.
+func TestUnit_PendingBudget_BombShapeAllocations(t *testing.T) {
+	limits := map[string]int{"cycle": 5, "decoy": 2, "skipdep": 2, "dup": 2}
+	for _, shape := range []string{"cycle", "decoy", "skipdep", "dup"} {
+		for _, version := range []int{1, 2} {
+			t.Run(fmt.Sprintf("%s/V%d", shape, version), func(t *testing.T) {
+				update := pendingBombShape(version, shape, 5000)
+				apply := ApplyUpdateV1
+				if version == 2 {
+					apply = ApplyUpdateV2
+				}
+				runtime.GC()
+				var before, after runtime.MemStats
+				runtime.ReadMemStats(&before)
+				doc := New(WithMaxPendingItems(16))
+				err := apply(doc, update, nil)
+				runtime.ReadMemStats(&after)
+				defer doc.Destroy()
+				if !errors.Is(err, ErrInvalidUpdate) || doc.PendingStats().Items != 0 {
+					t.Fatalf("err=%v pending=%d", err, doc.PendingStats().Items)
+				}
+				limit := uint64(limits[shape]*len(update) + 128*1024)
+				if version == 2 {
+					limit += uint64(2 * len(update))
+				}
+				if allocated := after.TotalAlloc - before.TotalAlloc; allocated > limit {
+					t.Fatalf("wire=%d allocated=%d limit=%d", len(update), allocated, limit)
+				}
+			})
+		}
 	}
 }
 
@@ -268,8 +364,9 @@ func TestUnit_PendingBudget_SupersededKeepsClientOrder(t *testing.T) {
 	}
 }
 
-// Preserve wire order and duplicate client groups in both formats.
-func pendingGuardUpdate(source *Doc, groups [][]*Item, skips map[int]bool, version int) []byte {
+// Preserve wire order and duplicate client groups in both formats. skips
+// inserts a skip of the given length after a group's first struct.
+func pendingGuardUpdate(source *Doc, groups [][]*Item, skips map[int]uint64, version int) []byte {
 	enc := encoding.NewEncoder()
 	var v2 *v2Encoder
 	if version == 2 {
@@ -279,7 +376,7 @@ func pendingGuardUpdate(source *Doc, groups [][]*Item, skips map[int]bool, versi
 	enc.WriteVarUint(uint64(len(groups)))
 	for i, items := range groups {
 		n := len(items)
-		if skips[i] {
+		if skips[i] > 0 {
 			n++
 		}
 		enc.WriteVarUint(uint64(n))
@@ -295,13 +392,13 @@ func pendingGuardUpdate(source *Doc, groups [][]*Item, skips map[int]bool, versi
 			} else {
 				encodeItemV2(v2, item, 0, source.store)
 			}
-			if j == 0 && skips[i] {
+			if j == 0 && skips[i] > 0 {
 				if v2 == nil {
 					enc.WriteUint8(10)
 				} else {
 					v2.writeInfo(10)
 				}
-				enc.WriteVarUint(1)
+				enc.WriteVarUint(skips[i])
 			}
 		}
 	}

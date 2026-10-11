@@ -117,6 +117,19 @@ func TestUnit_PendingBudget_ClassificationMatchesReference(t *testing.T) {
 		dropped := []*Item{item(12, 0, "q", id(50, 0), nil), item(12, 1, "r", id(50, 1), nil)}
 		cases = append(cases, tc{"superseded-ordered-survivors", [][]*Item{dropped, m[3], m[10], m[11], m[12], head}, StateVector{}})
 	}
+	{ // Many groups wait on one target; it resolves only up to its third struct.
+		// The chain outlasts the plain scans, so the target resolves in the worklist.
+		m := chain(3, 10, 11, 12, 13, 14, 15, 16)
+		target := []*Item{item(40, 0, "a", id(3, 0), nil), item(40, 1, "b", id(40, 0), nil), item(40, 2, "c", id(40, 1), nil),
+			item(40, 3, "d", id(50, 0), nil), item(40, 4, "e", id(40, 3), nil)}
+		groups := [][]*Item{m[3]}
+		for i, clock := range []uint64{4, 0, 2, 3, 1, 2, 0, 4, 1, 3} {
+			c := ClientID(60 + i)
+			groups = append(groups, []*Item{item(c, 0, "w", id(40, clock), nil), item(c, 1, "t", id(c, 0), nil)})
+		}
+		groups = append(groups, target, m[10], m[11], m[12], m[13], m[14], m[15], m[16])
+		cases = append(cases, tc{"many-watchers-one-target", groups, StateVector{}})
+	}
 	{ // A superseded short group for the dependency's client must not bound it.
 		m := chain(3, 10, 11, 12, 13, 14)
 		dropped := []*Item{item(40, 0, "x", id(50, 0), nil)}
