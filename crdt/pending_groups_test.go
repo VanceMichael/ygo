@@ -109,7 +109,7 @@ func TestUnit_PendingSummary_RoundTrip(t *testing.T) {
 		sizing.put(e.skip, e.length, e.deps)
 		fill.put(e.skip, e.length, e.deps)
 	}
-	require.Equal(t, sizing.size, len(fill.sum))
+	require.Len(t, fill.sum, sizing.size)
 	at := uint32(0)
 	for _, e := range entries {
 		skip, length, deps, n, next := pendingEntry(fill.sum, at)

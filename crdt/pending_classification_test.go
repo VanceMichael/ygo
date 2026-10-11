@@ -122,7 +122,8 @@ func TestUnit_PendingBudget_ClassificationMatchesReference(t *testing.T) {
 		m := chain(3, 10, 11, 12, 13, 14, 15, 16)
 		target := []*Item{item(40, 0, "a", id(3, 0), nil), item(40, 1, "b", id(40, 0), nil), item(40, 2, "c", id(40, 1), nil),
 			item(40, 3, "d", id(50, 0), nil), item(40, 4, "e", id(40, 3), nil)}
-		groups := [][]*Item{m[3]}
+		groups := make([][]*Item, 0, 19)
+		groups = append(groups, m[3])
 		for i, clock := range []uint64{4, 0, 2, 3, 1, 2, 0, 4, 1, 3} {
 			c := ClientID(60 + i)
 			groups = append(groups, []*Item{item(c, 0, "w", id(40, clock), nil), item(c, 1, "t", id(c, 0), nil)})
