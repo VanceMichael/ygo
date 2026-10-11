@@ -1,3 +1,27 @@
+## v1.51.8
+
+**Who is affected:** servers that apply updates from untrusted peers. Updates
+encoded by yjs or ygo are unaffected by the behaviour change below.
+
+**Repeated client groups now behave like yjs.** An update can carry more than
+one wire group for the same client, although no standard encoder produces
+one. ygo used to integrate every such group, and overlapping groups put
+duplicate structs in the document, showed repeated text and moved the state
+vector backwards, without an error. ygo now keeps only the last group for each
+client and drops the earlier ones, exactly as yjs does, so both reach the same
+document. Content that appears only in an earlier group for a client is no
+longer applied. (#305)
+
+**Crafted incomplete updates are cheap to reject again.** Since v1.51.7 the
+pending-limit preflight kept a full decoder copy for each blocked wire group
+when the missing dependency was present in the update but could never resolve,
+for example in a dependency cycle. Such an update could allocate dozens of
+times its own size before being rejected. Preflight now keeps only a compact
+record per blocked group, so rejection stays within a few times the update's
+size, and updates that can resolve are still accepted. (#306)
+
+**Upgrading.** No API change.
+
 ## v1.51.7
 
 **Who is affected:** servers that store or exchange large full-document updates,
