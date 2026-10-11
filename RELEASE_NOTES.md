@@ -17,8 +17,8 @@ pending-limit preflight kept a full decoder copy for each blocked wire group
 when the missing dependency was present in the update but could never resolve,
 for example in a dependency cycle. Such an update could allocate dozens of
 times its own size before being rejected. Preflight now keeps only a compact
-record per blocked group, so rejection stays within a few times the update's
-size, and updates that can resolve are still accepted. (#306)
+record per blocked group, so rejection costs at most about 11 times the
+update's size, and updates that can resolve are still accepted. (#306)
 
 **Upgrading.** No API change.
 

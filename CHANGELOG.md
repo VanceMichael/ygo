@@ -15,12 +15,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   so overlapping structs were integrated again: the store held duplicates, the
   text showed repeated content and the state vector went backwards, with no
   error. ygo now matches yjs, which keeps only the last group for each client
-  and drops earlier groups without integrating them. This is a behaviour
-  change for such updates: content found only in an earlier group for a
-  client is no longer applied. yjs and ygo never encode repeated groups, so
-  their updates are unaffected. The pending-limit preflight
-  counts only the groups that are integrated, so a dropped group can no longer
-  cause a rejection. (#305)
+  and drops earlier groups without integrating them. An update whose group
+  framing is malformed is rejected before any group is integrated, so a bad
+  later group can no longer leave the earlier ones applied. This is a behaviour
+  change for such updates: content found only in an earlier group for a client
+  is no longer applied. yjs and ygo never encode repeated groups, so their
+  updates are unaffected. The pending-limit preflight counts only the groups
+  that are integrated, so a dropped group can no longer cause a rejection.
+  (#305)
 - **`crdt`: rejecting some crafted incomplete updates allocated far more than
   their size.** The pending-limit preflight kept a full decoder copy for every
   blocked wire group whose dependency was present in the update but could never
@@ -29,8 +31,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   before being rejected. Preflight now keeps a small record per blocked group
   and its blocked structs as compact varints, and rules out dependencies a
   client can never reach before keeping anything. Rejecting these updates now
-  allocates at most a few times their size. Updates that can resolve are still
-  accepted. (#306)
+  allocates at most about 11 times their size, and in linear time. Updates that
+  can resolve are still accepted. (#306)
 
 ## [1.51.7] — 2026-10-11
 

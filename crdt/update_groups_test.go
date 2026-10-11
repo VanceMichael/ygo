@@ -78,3 +78,96 @@ func TestUnit_SupersededGroups_MatchLastGroupPerClient(t *testing.T) {
 		}
 	}
 }
+
+// repeatedGroupsUpdate encodes client 9's "abc", then client 9 again with only
+// "a", then, if malformed, a group whose struct has an unknown content tag.
+func repeatedGroupsUpdate(t *testing.T, version int, malformed bool) []byte {
+	t.Helper()
+	src := New(WithClientID(9))
+	defer src.Destroy()
+	text := src.GetText("t")
+	for _, s := range []string{"a", "b", "c"} {
+		src.Transact(func(txn *Transaction) { text.Insert(txn, text.Len(), s, nil) })
+	}
+	items := src.store.clients[9]
+	groups := uint64(2)
+	if malformed {
+		groups = 3
+	}
+	if version == 1 {
+		enc := encoding.NewEncoder()
+		enc.WriteVarUint(groups)
+		enc.WriteVarUint(uint64(len(items)))
+		enc.WriteVarUint(9)
+		enc.WriteVarUint(0)
+		for _, it := range items {
+			encodeItem(enc, it, 0, src.store)
+		}
+		enc.WriteVarUint(1)
+		enc.WriteVarUint(9)
+		enc.WriteVarUint(0)
+		encodeItem(enc, items[0], 0, src.store)
+		if malformed {
+			enc.WriteVarUint(1)
+			enc.WriteVarUint(10)
+			enc.WriteVarUint(0)
+			enc.WriteUint8(0x1f)
+			enc.WriteUint8(1)
+			enc.WriteVarString("t")
+		}
+		encodeDeleteSet(enc, newDeleteSet())
+		return enc.Bytes()
+	}
+	e2 := newV2Encoder()
+	e2.restEnc.WriteVarUint(groups)
+	e2.restEnc.WriteVarUint(uint64(len(items)))
+	e2.writeClient(9)
+	e2.restEnc.WriteVarUint(0)
+	for _, it := range items {
+		encodeItemV2(e2, it, 0, src.store)
+	}
+	e2.restEnc.WriteVarUint(1)
+	e2.writeClient(9)
+	e2.restEnc.WriteVarUint(0)
+	encodeItemV2(e2, items[0], 0, src.store)
+	if malformed {
+		e2.restEnc.WriteVarUint(1)
+		e2.writeClient(10)
+		e2.restEnc.WriteVarUint(0)
+		e2.writeInfo(0x1f)
+		e2.writeParentInfo(true)
+		e2.writeString("t")
+	}
+	encodeDeleteSetV2(e2, newDeleteSet())
+	return e2.toBytes()
+}
+
+func applyVersion(doc *Doc, version int, update []byte) error {
+	if version == 1 {
+		return ApplyUpdateV1(doc, update, nil)
+	}
+	return ApplyUpdateV2(doc, update, nil)
+}
+
+func TestUnit_SupersededGroups_TwoGroupsKeepLast(t *testing.T) {
+	for _, version := range []int{1, 2} {
+		doc := New()
+		require.NoError(t, applyVersion(doc, version, repeatedGroupsUpdate(t, version, false)))
+		require.Equal(t, "a", doc.GetText("t").ToString(), "V%d", version)
+		require.Equal(t, uint64(1), doc.StateVector().Clock(9), "V%d", version)
+		doc.Destroy()
+	}
+}
+
+// A malformed later group must reject the update before any group integrates,
+// or the superseded groups would already be applied.
+func TestUnit_SupersededGroups_MalformedLaterGroupAppliesNothing(t *testing.T) {
+	for _, version := range []int{1, 2} {
+		doc := New()
+		require.Error(t, applyVersion(doc, version, repeatedGroupsUpdate(t, version, true)), "V%d", version)
+		require.Empty(t, doc.GetText("t").ToString(), "V%d", version)
+		require.Empty(t, doc.StateVector(), "V%d", version)
+		require.Empty(t, doc.store.clients[9], "V%d", version)
+		doc.Destroy()
+	}
+}

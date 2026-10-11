@@ -615,8 +615,11 @@ func applyV2Txn(txn *Transaction, update []byte) (retErr error) {
 	var pending []*Item
 	var superseded groupSet
 	if numClients > 1 {
-		// On a malformed update the decoder below reports the error.
-		superseded, _ = supersededGroups(update, &initialV2, budget.v2Rest)
+		// Fail before integrating anything: a later malformed group must not
+		// leave earlier, superseded groups applied.
+		if superseded, err = supersededGroups(update, &initialV2, budget.v2Rest); err != nil {
+			return wrapUpdateErr(err)
+		}
 	}
 	budget.setSuperseded(superseded)
 

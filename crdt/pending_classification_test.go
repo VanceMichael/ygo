@@ -158,3 +158,37 @@ func TestUnit_PendingBudget_ClassificationMatchesReference(t *testing.T) {
 		}
 	}
 }
+
+// A skip that ends exactly at the known clock leaves the client's later
+// structs reachable, so a dependency on them is not impossible.
+func TestUnit_PendingBudget_SkipEndingAtKnownClock(t *testing.T) {
+	source := New()
+	defer source.Destroy()
+	text := source.GetText("text")
+	item := func(c ClientID, clock uint64, origin *ID) *Item {
+		i := &Item{ID: ID{Client: c, Clock: clock}, Origin: origin, Content: NewContentString("x")}
+		if origin == nil {
+			i.Parent = &text.abstractType
+		}
+		return i
+	}
+	id := func(c ClientID, clock uint64) *ID { return &ID{Client: c, Clock: clock} }
+	groups := [][]*Item{
+		{item(20, 0, id(10, 2))},
+		{item(10, 0, nil), item(10, 2, id(31, 0))},
+		{item(31, 0, id(32, 0))},
+		{item(32, 0, id(33, 0))},
+		{item(33, 0, nil)},
+	}
+	initial := StateVector{10: 2}
+	for _, version := range []int{1, 2} {
+		update := pendingGuardUpdate(source, groups, map[int]uint64{1: 1}, version)
+		for rem := 0; rem <= 7; rem++ {
+			b := pendingBudget{initial: initial, update: update, v2: version == 2, remaining: rem}
+			want := referencePendingBudgetCheck(b, rem)
+			if got := b.check(rem); (want == nil) != (got == nil) {
+				t.Fatalf("V%d rem=%d: preflight=%v, reference=%v", version, rem, got, want)
+			}
+		}
+	}
+}

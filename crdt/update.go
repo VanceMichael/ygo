@@ -556,8 +556,12 @@ func decodeAndPark(txn *Transaction, dec *encoding.Decoder, sv StateVector, numC
 	budget := newPendingBudget(txn.doc, sv, update, false)
 	var superseded groupSet
 	if numClients > 1 {
-		// On a malformed update the decoder below reports the error.
-		superseded, _ = supersededGroups(update, nil, encoding.Decoder{})
+		// Fail before integrating anything: a later malformed group must not
+		// leave earlier, superseded groups applied.
+		var err error
+		if superseded, err = supersededGroups(update, nil, encoding.Decoder{}); err != nil {
+			return nil, err
+		}
 	}
 	budget.setSuperseded(superseded)
 
