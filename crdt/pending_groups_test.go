@@ -130,8 +130,8 @@ func TestUnit_PendingScanner_CheckpointIsIndependent(t *testing.T) {
 	}
 }
 
-// A later overlapping group can cover a blocked head independently of its
-// missing external dependency. Waking coverage must cancel the other watch.
+// A later group for client 1 supersedes its blocked 100-struct group, so only
+// client 3's missing parent stays pending.
 func pendingOverlappingGroups(version int) []byte {
 	source := New()
 	defer source.Destroy()

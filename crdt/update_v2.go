@@ -613,6 +613,12 @@ func applyV2Txn(txn *Transaction, update []byte) (retErr error) {
 	}
 
 	var pending []*Item
+	var superseded groupSet
+	if numClients > 1 {
+		// On a malformed update the decoder below reports the error.
+		superseded, _ = supersededGroups(update, &initialV2, budget.v2Rest)
+	}
+	budget.setSuperseded(superseded)
 
 	totalStructs := uint64(0)
 	for i := uint64(0); i < numClients; i++ {
@@ -634,6 +640,7 @@ func applyV2Txn(txn *Transaction, update []byte) (retErr error) {
 		}
 
 		existingEnd := sv.Clock(client)
+		drop := superseded.has(i)
 
 		for j := uint64(0); j < numStructs; j++ {
 			info, err := dec.readInfo()
@@ -651,6 +658,9 @@ func applyV2Txn(txn *Transaction, update []byte) (retErr error) {
 				l, err := dec.readLen()
 				if err != nil {
 					return wrapUpdateErr(err)
+				}
+				if drop {
+					continue
 				}
 				length := uint64(l)
 				itemEnd := clock + length
@@ -703,6 +713,9 @@ func applyV2Txn(txn *Transaction, update []byte) (retErr error) {
 				item, contentLen, derr = decodeItemV2(dec, txn.doc, client, clock, info)
 				if derr != nil {
 					return wrapUpdateErr(derr)
+				}
+				if drop {
+					continue
 				}
 			}
 

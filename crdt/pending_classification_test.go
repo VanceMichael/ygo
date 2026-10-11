@@ -51,7 +51,7 @@ func TestUnit_PendingBudget_ClassificationMatchesReference(t *testing.T) {
 		head := []*Item{item(13, 0, "h", id(3, 1), nil), item(13, 1, "t", id(13, 0), nil)}
 		cases = append(cases, tc{"descending-gap-edge", [][]*Item{head, m[12], m[11], m[10], three}, StateVector{}})
 	}
-	{ // Descending wire with a repeated client: its later, still-blocked group fills the other's clock gap.
+	{ // Descending wire with a repeated client: only its later, still-blocked group is integrated.
 		m := chain(12, 11, 10)
 		head := []*Item{item(13, 0, "h", id(3, 1), nil), item(13, 1, "t", id(13, 0), nil)}
 		later := []*Item{item(3, 1, "y", id(3, 0), id(10, 0))}
@@ -68,7 +68,7 @@ func TestUnit_PendingBudget_ClassificationMatchesReference(t *testing.T) {
 		head := []*Item{item(20, 0, "h", id(30, 0), id(3, 0)), item(20, 1, "t", id(20, 0), nil)}
 		cases = append(cases, tc{"known-absent-client", [][]*Item{m[3], m[10], m[11], m[12], m[13], head, m[14]}, StateVector{30: 1}})
 	}
-	{ // The dependency's client has two groups; only the later, longer one covers it.
+	{ // The dependency's client has two groups; only the later one is integrated.
 		m := chain(3, 10, 11, 12, 13, 14)
 		d1 := []*Item{item(40, 0, "x", nil, nil)}
 		d2 := []*Item{item(40, 1, "abcd", id(40, 0), id(3, 0))}
@@ -81,8 +81,8 @@ func TestUnit_PendingBudget_ClassificationMatchesReference(t *testing.T) {
 		lost := []*Item{item(22, 0, "c", id(50, 0), nil)}
 		cases = append(cases, tc{"cycle-and-permanent-head", [][]*Item{m[3], m[10], cycle[0], cycle[1], lost}, StateVector{}})
 	}
-	{ // A head the classification cannot prove permanent (its dependency's client has
-		// overlapping groups), left over after the worklist next to provable ones.
+	{ // A head whose dependency's client has a superseded group, left over after
+		// the worklist next to provable ones.
 		m := chain(3, 10, 11)
 		dup := []*Item{item(40, 0, "d", nil, nil)}
 		open := []*Item{item(30, 0, "o", id(40, 5), nil)}
@@ -97,6 +97,32 @@ func TestUnit_PendingBudget_ClassificationMatchesReference(t *testing.T) {
 		}
 		cases = append(cases, tc{"ordered-permanent-heads", [][]*Item{m[3], m[10], m[11], m[12], lost[0], lost[1]}, StateVector{}})
 		cases = append(cases, tc{"unordered-permanent-heads", [][]*Item{m[12], lost[0], m[3], lost[1], m[11], m[10]}, StateVector{}})
+	}
+	{ // A superseded group's blocked tail must not count; only the last group is integrated.
+		m := chain(3, 10, 11, 12)
+		dropped := []*Item{item(20, 0, "a", id(50, 0), nil), item(20, 1, "b", id(50, 1), nil), item(20, 2, "c", id(20, 1), nil)}
+		last := []*Item{item(20, 0, "z", id(3, 0), nil)}
+		cases = append(cases, tc{"superseded-tail-not-counted", [][]*Item{m[3], dropped, m[10], m[11], m[12], last}, StateVector{}})
+	}
+	{ // A head needs a clock only the superseded group carried.
+		m := chain(3, 10, 11, 12)
+		dropped := []*Item{item(20, 0, "abc", id(3, 0), nil)}
+		head := []*Item{item(30, 0, "h", id(20, 2), nil), item(30, 1, "t", id(30, 0), nil)}
+		last := []*Item{item(20, 0, "a", id(3, 0), nil)}
+		cases = append(cases, tc{"superseded-dependency", [][]*Item{dropped, m[3], m[10], m[11], m[12], head, last}, StateVector{}})
+	}
+	{ // Ascending survivors; the dropped group alone breaks the order.
+		m := chain(3, 10, 11, 12)
+		head := []*Item{item(20, 0, "h", id(40, 0), nil), item(20, 1, "t", id(20, 0), nil)}
+		dropped := []*Item{item(12, 0, "q", id(50, 0), nil), item(12, 1, "r", id(50, 1), nil)}
+		cases = append(cases, tc{"superseded-ordered-survivors", [][]*Item{dropped, m[3], m[10], m[11], m[12], head}, StateVector{}})
+	}
+	{ // A superseded short group for the dependency's client must not bound it.
+		m := chain(3, 10, 11, 12, 13, 14)
+		dropped := []*Item{item(40, 0, "x", id(50, 0), nil)}
+		last := []*Item{item(40, 0, "abcd", id(3, 0), nil)}
+		head := []*Item{item(20, 0, "h", id(40, 3), nil), item(20, 1, "t", id(20, 0), nil)}
+		cases = append(cases, tc{"superseded-short-bound", [][]*Item{m[3], m[10], dropped, m[11], m[12], m[13], head, last, m[14]}, StateVector{}})
 	}
 	for _, c := range cases {
 		structs := 0

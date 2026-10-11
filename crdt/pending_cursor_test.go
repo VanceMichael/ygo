@@ -6,6 +6,8 @@ import (
 	"runtime"
 	"testing"
 
+	"github.com/stretchr/testify/require"
+
 	"github.com/reearth/ygo/encoding"
 )
 
@@ -37,7 +39,8 @@ func pendingCursorBomb(version, m int) []byte {
 	return encodeStructStoreV1(groups, newDeleteSet(), nil, doc.store)
 }
 
-// Fails if the worklist no longer wakes a head covered by another group.
+// A head in a superseded group must not count, even when its client's last
+// group covers the same clocks.
 func TestUnit_PendingBudget_OverlapWakeMatchesReference(t *testing.T) {
 	source := New()
 	defer source.Destroy()
@@ -226,8 +229,8 @@ func TestUnit_PendingBudget_ClientRangeMatchesReference(t *testing.T) {
 						groups[0], groups[1] = groups[1], groups[0]
 					}
 					if order == "duplicate" {
-						// A late overlapping group may cover an otherwise impossible
-						// head; the global range must not classify it as permanent.
+						// A late group for the head's client supersedes it; the global
+						// range must classify only the surviving group.
 						groups = append(groups, []*Item{{ID: ID{Client: 20}, Parent: &text.abstractType, Origin: &ID{Client: 2}, Content: NewContentString("cc")}})
 					}
 					update := pendingGuardUpdate(source, groups, nil, version)
@@ -240,6 +243,28 @@ func TestUnit_PendingBudget_ClientRangeMatchesReference(t *testing.T) {
 				})
 			}
 		}
+	}
+}
+
+// Superseded groups are never integrated, so they must not break the client
+// order that rules out absent dependencies without an index.
+func TestUnit_PendingBudget_SupersededKeepsClientOrder(t *testing.T) {
+	source := New()
+	defer source.Destroy()
+	text := source.GetText("text")
+	x := func(c ClientID) []*Item {
+		return []*Item{{ID: ID{Client: c}, Parent: &text.abstractType, Content: NewContentString("x")}}
+	}
+	for _, version := range []int{1, 2} {
+		update := pendingGuardUpdate(source, [][]*Item{x(2), x(9), x(4), x(6), x(9)}, nil, version)
+		b := pendingBudget{update: update, v2: version == 2}
+		require.NoError(t, b.check(0))
+		require.True(t, b.superseded.has(1), "V%d", version)
+		var r pendingClientRange
+		_, err := scanPendingGroups(newPendingScanner(update, version == 2), StateVector{}, 0, &r, b.superseded)
+		require.NoError(t, err)
+		require.True(t, r.ordered, "V%d", version)
+		require.Equal(t, [2]ClientID{2, 9}, [2]ClientID{r.min, r.max})
 	}
 }
 
