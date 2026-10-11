@@ -22,7 +22,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is no longer applied. yjs and ygo never encode repeated groups, so their
   updates are unaffected. The pending-limit preflight counts only the groups
   that are integrated, so a dropped group can no longer cause a rejection.
-  (#305)
+  `MergeUpdatesV1/V2`, `DiffUpdateV1/V2`,
+  `EncodeStateVectorFromUpdate(V2)` and the `ContentMap` constructors apply the
+  same rule, so merging or diffing such an update no longer changes what it
+  applies. (#305, #308)
 - **`crdt`: rejecting some crafted incomplete updates allocated far more than
   their size.** The pending-limit preflight kept a full decoder copy for every
   blocked wire group whose dependency was present in the update but could never

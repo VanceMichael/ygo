@@ -171,3 +171,18 @@ func TestUnit_SupersededGroups_MalformedLaterGroupAppliesNothing(t *testing.T) {
 		doc.Destroy()
 	}
 }
+
+func TestUnit_SupersededGroups_StateVectorFromUpdate(t *testing.T) {
+	for _, version := range []int{1, 2} {
+		update := repeatedGroupsUpdate(t, version, false)
+		encode := EncodeStateVectorFromUpdate
+		if version == 2 {
+			encode = EncodeStateVectorFromUpdateV2
+		}
+		raw, err := encode(update)
+		require.NoError(t, err)
+		sv, err := DecodeStateVectorV1(raw)
+		require.NoError(t, err)
+		require.Equal(t, StateVector{9: 1}, sv, "V%d", version)
+	}
+}

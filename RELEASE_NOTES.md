@@ -10,7 +10,8 @@ duplicate structs in the document, showed repeated text and moved the state
 vector backwards, without an error. ygo now keeps only the last group for each
 client and drops the earlier ones, exactly as yjs does, so both reach the same
 document. Content that appears only in an earlier group for a client is no
-longer applied. (#305)
+longer applied. `MergeUpdates`, `DiffUpdate` and `EncodeStateVectorFromUpdate`
+follow the same rule, so they agree with applying the update. (#305, #308)
 
 **Crafted incomplete updates are cheap to reject again.** Since v1.51.7 the
 pending-limit preflight kept a full decoder copy for each blocked wire group
