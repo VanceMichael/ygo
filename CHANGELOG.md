@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.51.10] — 2026-10-14
+
+### Fixed
+
+- **`crdt`: a small crafted V2 update could pin a CPU core.** Since v1.51.8,
+  `ApplyUpdateV2` scans group headers before decoding an update with more than
+  one client group. For a JSON item, that scan stepped over each declared value
+  without reading any bytes, so a length the update could never supply cost up
+  to about a million iterations per item. An update of a few dozen bytes could
+  spin for seconds, and a crafted one far longer, before being rejected. The
+  scan now skips V2 JSON content in constant time. V1 updates and valid V2
+  updates are unaffected.
+
 ## [1.51.9] — 2026-10-12
 
 ### Performance
