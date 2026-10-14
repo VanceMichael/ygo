@@ -1,15 +1,43 @@
 ## v1.51.10
 
-**Who is affected:** servers on v1.51.8 or v1.51.9 that apply V2 updates from
-untrusted peers.
+**Crafted V2 updates can no longer pin a CPU core.** This affects servers
+on v1.51.8 or v1.51.9 that apply V2 updates from untrusted peers. v1.51.8 added
+a scan of an update's group headers before decoding. For JSON content in a V2
+update, the scan did work proportional to the item's declared length, up to
+about a million steps per item, without reading any input. An update of a few
+dozen bytes could keep a core busy for seconds, and a crafted one for much
+longer, before being rejected. The scan now skips that content in constant
+time.
 
-**Crafted V2 updates can no longer pin a CPU core.** v1.51.8 added a scan of an
-update's group headers before decoding. For JSON content in a V2 update, the
-scan did work proportional to the item's declared length, up to about a million
-steps per item, without reading any input. An update of a few dozen bytes could
-keep a core busy for seconds, and a crafted one for much longer, before being
-rejected. The scan now skips that content in constant time. The public API and
-wire format are unchanged.
+**Who is affected: anyone who stores rooms with `persistence.MemoryPersistence`,
+`persistence.FilePersistence` or `persistence/sqlite` (for example through
+`NewServerWithPersistence(persistence.NewLegacyAdapter(...))`), and anyone who
+calls `Server.BroadcastUpdate` or runs a cluster relay.** Custom persistence
+adapters are not changed.
+
+**Large edits are stored, and so is everything after them.** These
+stores check each update before writing it by decoding it on its own, and that
+check held at most 100,000 structs waiting for state it did not have. Decoded
+on its own, an update from a client whose earlier edits are already stored is
+missing everything it builds on, so all of its structs wait. Any such update
+of more than 100,000 structs, or a batch of smaller ones the server coalesced
+past that count, was refused with `crdt: invalid update` although the room had
+applied it. With the default write coalescing, the refused batch stayed queued
+and each later edit joined it, so nothing more in that room was stored: the
+room stayed in memory after its last peer left, and every edit since the
+refused one was lost when it closed. The check now has no such limit. Updates
+that do not decode are still refused.
+
+**Large relayed updates reach every peer.** `BroadcastUpdate` ran the same
+check, so it refused such an update with `ErrInvalidUpdate` after the room had
+applied it, and a clustered node that received one from another node applied
+it to its room but never sent it to its own peers. It now uses the stores'
+check. `MaxPendingItems` still caps each room's document.
+
+**Custom adapters.** A `VersionedPersistence` that checks updates by applying
+them to a bare `crdt.New()` refuses the same updates; the `AppendUpdate` godoc
+shows how to build the scratch document instead. No API or wire format
+changes.
 
 ## v1.51.9
 
