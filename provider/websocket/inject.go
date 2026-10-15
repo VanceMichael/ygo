@@ -222,8 +222,16 @@ func (s *Server) broadcastUpdate(ctx context.Context, room string, update []byte
 	}
 	s.rmu.RLock()
 	rm, ok := s.rooms[room]
+	g := s.graves[room]
 	s.rmu.RUnlock()
 	if !ok {
+		// A permanently deleted name is a distinct error from a room that was
+		// never resident: callers can tell "gone for good" from ephemeral
+		// ErrRoomNotFound, and the relay inbound path refuses rather than
+		// auto-recreating the room.
+		if g.deleted {
+			return ErrRoomDeleted
+		}
 		return ErrRoomNotFound
 	}
 	// Gate on the room's load barrier (#182). For the public BroadcastUpdate path

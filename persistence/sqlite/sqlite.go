@@ -45,6 +45,11 @@ CREATE TABLE IF NOT EXISTS checkpoints (
   room             TEXT    NOT NULL PRIMARY KEY,
   target           INTEGER NOT NULL,
   rolled_back_head BLOB
+);
+CREATE TABLE IF NOT EXISTS room_tombstones (
+  room       TEXT    NOT NULL PRIMARY KEY,
+  generation INTEGER NOT NULL,
+  deleted_at INTEGER NOT NULL
 );`
 
 // rolled_back_head is persisted for FilePersistence parity and forensics;
@@ -220,6 +225,7 @@ var (
 	_ persistence.SnapshotStore                = (*Store)(nil)
 	_ persistence.SnapshotVersionedPersistence = (*Store)(nil)
 	_ persistence.RoomLister                   = (*Store)(nil)
+	_ persistence.RoomTombstoneStore           = (*Store)(nil)
 	_ persistence.CrashInjector                = (*Store)(nil)
 	_ persistence.Reopener                     = (*Store)(nil)
 )

@@ -36,6 +36,13 @@ func (s *Store) Load(ctx context.Context, room string) (persistence.LoadResult, 
 		return persistence.LoadResult{}, err
 	}
 	defer tx.Rollback() //nolint:errcheck
+	var tombGen sql.NullInt64
+	if err := tx.QueryRowContext(ctx,
+		`SELECT generation FROM room_tombstones WHERE room = ?`, room).Scan(&tombGen); err == nil {
+		return persistence.LoadResult{}, persistence.ErrRoomDeleted
+	} else if err != sql.ErrNoRows {
+		return persistence.LoadResult{}, err
+	}
 	head, err := s.clampedHead(ctx, tx, room)
 	if err != nil {
 		return persistence.LoadResult{}, err
@@ -61,6 +68,9 @@ func (s *Store) AppendUpdate(ctx context.Context, room string, update []byte) (p
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := s.checkAliveLocked(ctx, room); err != nil {
+		return 0, err
+	}
 	if err := s.recoverInterruptedPrune(ctx, room); err != nil {
 		return 0, err
 	}
@@ -169,6 +179,9 @@ func (s *Store) CaptureSnapshot(ctx context.Context, room, name string, state []
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := s.checkAliveLocked(ctx, room); err != nil {
+		return 0, err
+	}
 	// Under s.mu: no concurrent writer, so the bare handle is a consistent enough
 	// read for the single clampedHead statement (no read tx needed).
 	head, err := s.clampedHead(ctx, s.db, room)
@@ -218,6 +231,9 @@ func (s *Store) Compact(ctx context.Context, room string, keep int) (int, error)
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := s.checkAliveLocked(ctx, room); err != nil {
+		return 0, err
+	}
 	if err := s.recoverInterruptedPrune(ctx, room); err != nil {
 		return 0, err
 	}
@@ -293,6 +309,7 @@ func (s *Store) Delete(ctx context.Context, room string) error {
 		`DELETE FROM snapshots WHERE room = ?`,
 		`DELETE FROM snapshot_versions WHERE room = ?`,
 		`DELETE FROM checkpoints WHERE room = ?`,
+		`DELETE FROM room_tombstones WHERE room = ?`,
 	} {
 		if _, err := tx.ExecContext(ctx, q, room); err != nil {
 			return err
@@ -314,6 +331,9 @@ func (s *Store) PruneAfter(ctx context.Context, room string, target persistence.
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := s.checkAliveLocked(ctx, room); err != nil {
+		return err
+	}
 
 	// Phase 1: durably record the checkpoint (prune ceiling + rolled-back head).
 	// rolledBack is stored for parity/forensics only; this backend reconstructs
@@ -346,6 +366,9 @@ func (s *Store) SaveSnapshot(ctx context.Context, room, label string, state []by
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := s.checkAliveLocked(ctx, room); err != nil {
+		return 0, err
+	}
 	res, err := s.db.ExecContext(ctx,
 		`INSERT INTO snapshot_versions (room, label, created_at, state) VALUES (?, ?, ?, ?)`,
 		room, label, time.Now().UnixNano(), state)

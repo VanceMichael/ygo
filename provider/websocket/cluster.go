@@ -32,6 +32,12 @@ type clusterRelay interface {
 type relayRoomLane struct {
 	lane *relaylane.Lane
 	done chan struct{}
+	// exited is closed by the lane worker after its final drain finishes and
+	// the goroutine returns. DeleteRoom waits on it so the room's relay
+	// subscription is fully retired (and no trailing Publish for the old
+	// generation can still happen) BEFORE it wipes storage and publishes the
+	// room's KindDelete event.
+	exited chan struct{}
 }
 
 // relayOriginSentinel is the concrete type of the origin value AttachRelay
@@ -175,7 +181,11 @@ func (s *Server) ensureRelayLane(room string) *relayRoomLane {
 		return nil // no relay attached
 	}
 	prev, hadPrev := s.relayLanes[room]
-	l := &relayRoomLane{lane: relaylane.New(0), done: make(chan struct{})}
+	l := &relayRoomLane{
+		lane:   relaylane.New(0),
+		done:   make(chan struct{}),
+		exited: make(chan struct{}),
+	}
 	s.relayLanes[room] = l
 	// Register the worker on relayWG INSIDE the locked section: Shutdown's
 	// retireRelayLanes sets s.relayLanes to nil under this same mutex before
@@ -257,6 +267,7 @@ func (s *Server) relayLaneFor(room string) *relayRoomLane {
 // two distinct lanes, not a violation of this one.
 func (s *Server) relayLaneWorker(ctx context.Context, room string, l *relayRoomLane) {
 	defer s.relayWG.Done()
+	defer close(l.exited)
 	for {
 		select {
 		case <-ctx.Done():
@@ -754,6 +765,13 @@ func (s *Server) Inject(ctx context.Context, in cluster.Inbound) error {
 	}
 
 	switch in.Kind {
+	case cluster.KindDelete, cluster.KindReset:
+		// Control plane: permanent delete / explicit new generation. Applied
+		// idempotently by generation and never re-published (see
+		// applyRemoteLifecycle). A node with no resident room still records
+		// the barrier/tombstone, so a later connection cannot resurrect it.
+		return s.applyRemoteLifecycle(ctx, in)
+
 	case cluster.KindSync:
 		rm, _, err := s.getOrCreateRoom(ctx, in.Room)
 		if err != nil {

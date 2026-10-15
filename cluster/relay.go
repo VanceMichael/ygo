@@ -35,6 +35,24 @@ const (
 	// KindAwareness is an awareness update: Data is an awareness update blob
 	// suitable for awareness.Awareness.ApplyUpdate / EncodeUpdate.
 	KindAwareness
+	// KindDelete is a room lifecycle event: the room has been permanently
+	// deleted at the generation carried in Data (see EncodeLifecycleEvent).
+	// Unlike KindSync/KindAwareness it is CONTROL-PLANE traffic: every
+	// reachable node must receive it even if it has never activated the room
+	// (a node may hold a durable tombstone, a relay subscription, or a
+	// per-room stream for it), so a Relay MUST route KindDelete on a
+	// cluster-wide control channel rather than only to subscribed nodes, and
+	// MUST NOT coalesce or drop it under backpressure. A Sink applies it
+	// idempotently: events at or below the generation already recorded are
+	// stale duplicates. See websocket.Server.DeleteRoom.
+	KindDelete
+	// KindReset is a room lifecycle event: an administrator explicitly opened
+	// a new generation and the name may be reused from an empty state. It
+	// travels on the same cluster-wide control channel as KindDelete with the
+	// same generation/idempotency rules; a reset event older than the
+	// recorded deletion generation is ignored, so a delayed delete can never
+	// re-tombstone a newer generation. See websocket.Server.ResetRoom.
+	KindReset
 )
 
 // String returns a human-readable name for the kind.
@@ -44,6 +62,10 @@ func (k Kind) String() string {
 		return "sync"
 	case KindAwareness:
 		return "awareness"
+	case KindDelete:
+		return "delete"
+	case KindReset:
+		return "reset"
 	default:
 		return "unknown"
 	}
@@ -76,6 +98,14 @@ type Sink interface {
 	// is applied to the room's crdt.Doc with the relay sentinel origin and
 	// rebroadcast to local peers; for KindAwareness it is merged into the
 	// room's awareness.Awareness with the relay sentinel origin.
+	//
+	// KindDelete / KindReset are control-plane lifecycle events (Data =
+	// EncodeLifecycleEvent(generation)): a Sink MUST apply the same permanent
+	// delete / explicit new-generation it would for a local admin call, MUST
+	// be idempotent by generation, MUST NOT re-publish the event, and MUST
+	// tolerate delivery to a node that has never activated the room. An
+	// event at or below the generation already observed for the room is a
+	// stale duplicate and changes nothing.
 	//
 	// Inject MAY BE CALLED CONCURRENTLY for distinct rooms — a relay is not
 	// required to deliver every room from a single goroutine, and every Sink

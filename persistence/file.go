@@ -78,6 +78,57 @@ func (f *FilePersistence) checkpointPath(room string) string {
 	return filepath.Join(f.roomDir(room), "checkpoint")
 }
 
+// tombstonePath names the generation marker left by DeleteRoom. Its mere
+// presence means the room is permanently deleted: every mutating and load
+// operation refuses the name until ResetRoom removes the room directory.
+// The file content is the 8-byte big-endian recorded generation.
+func (f *FilePersistence) tombstonePath(room string) string {
+	return filepath.Join(f.roomDir(room), "tombstone")
+}
+
+// readTombstoneGen returns the recorded generation and true when the room is
+// tombstoned. A missing marker reports (0, false, nil). Caller holds f.mu.
+func (f *FilePersistence) readTombstoneGen(room string) (uint64, bool, error) {
+	data, err := os.ReadFile(f.tombstonePath(room))
+	if errors.Is(err, os.ErrNotExist) {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, err
+	}
+	if len(data) < 8 {
+		return 0, false, fmt.Errorf("persistence: corrupt tombstone for room %q", room)
+	}
+	return binary.BigEndian.Uint64(data[:8]), true, nil
+}
+
+// writeTombstone writes the generation marker atomically, first removing every
+// other room file. Caller holds f.mu.
+func (f *FilePersistence) writeTombstone(room string, gen uint64) error {
+	if err := os.RemoveAll(f.roomDir(room)); err != nil {
+		return err
+	}
+	if err := os.MkdirAll(f.roomDir(room), 0o755); err != nil {
+		return err
+	}
+	var buf [8]byte
+	binary.BigEndian.PutUint64(buf[:], gen)
+	return atomicWrite(f.tombstonePath(room), buf[:])
+}
+
+// aliveLocked returns ErrRoomDeleted when the room carries a tombstone. Caller
+// holds f.mu.
+func (f *FilePersistence) aliveLocked(room string) error {
+	_, tomb, err := f.readTombstoneGen(room)
+	if err != nil {
+		return err
+	}
+	if tomb {
+		return ErrRoomDeleted
+	}
+	return nil
+}
+
 // checkpoint holds the persisted prune ceiling and rolled-back head.
 type checkpoint struct {
 	target     Version
@@ -182,6 +233,9 @@ func (f *FilePersistence) Load(ctx context.Context, room string) (LoadResult, er
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if err := f.aliveLocked(room); err != nil {
+		return LoadResult{}, err
+	}
 	versions, cp, err := f.listUpdateVersions(room)
 	if err != nil {
 		return LoadResult{}, err
@@ -273,6 +327,9 @@ func (f *FilePersistence) AppendUpdate(ctx context.Context, room string, update 
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if err := f.aliveLocked(room); err != nil {
+		return 0, err
+	}
 	if err := os.MkdirAll(f.updatesDir(room), 0o755); err != nil {
 		return 0, err
 	}
@@ -344,6 +401,11 @@ func (f *FilePersistence) ListVersions(ctx context.Context, room string) ([]Vers
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if _, tomb, err := f.readTombstoneGen(room); err != nil {
+		return nil, err
+	} else if tomb {
+		return nil, nil // deleted room reads as having no history
+	}
 	versions, _, err := f.listUpdateVersions(room)
 	if err != nil {
 		return nil, err
@@ -368,6 +430,11 @@ func (f *FilePersistence) GetUpdate(ctx context.Context, room string, v Version)
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if _, tomb, err := f.readTombstoneGen(room); err != nil {
+		return nil, VersionMeta{}, false, err
+	} else if tomb {
+		return nil, VersionMeta{}, false, nil
+	}
 	cp, err := f.readCheckpoint(room)
 	if err != nil {
 		return nil, VersionMeta{}, false, err
@@ -400,6 +467,9 @@ func (f *FilePersistence) MaterializeAt(ctx context.Context, room string, v Vers
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if err := f.aliveLocked(room); err != nil {
+		return nil, err
+	}
 	versions, cp, err := f.listUpdateVersions(room)
 	if err != nil {
 		return nil, err
@@ -421,6 +491,9 @@ func (f *FilePersistence) CaptureSnapshot(ctx context.Context, room, name string
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if err := f.aliveLocked(room); err != nil {
+		return 0, err
+	}
 	versions, cp, err := f.listUpdateVersions(room)
 	if err != nil {
 		return 0, err
@@ -450,6 +523,11 @@ func (f *FilePersistence) RestoreSnapshot(ctx context.Context, room, name string
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if _, tomb, err := f.readTombstoneGen(room); err != nil {
+		return nil, 0, false, err
+	} else if tomb {
+		return nil, 0, false, nil
+	}
 	data, err := os.ReadFile(f.snapshotPath(room, name))
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, 0, false, nil
@@ -477,6 +555,9 @@ func (f *FilePersistence) PruneAfter(ctx context.Context, room string, target Ve
 	// after the checkpoint is written and before the deletes, which is here.
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if err := f.aliveLocked(room); err != nil {
+		return err
+	}
 	if _, err := os.Stat(f.roomDir(room)); errors.Is(err, os.ErrNotExist) {
 		return ErrRoomNotFound
 	}
@@ -534,6 +615,9 @@ func (f *FilePersistence) Compact(ctx context.Context, room string, keep int) (i
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if err := f.aliveLocked(room); err != nil {
+		return 0, err
+	}
 	versions, cp, err := f.listUpdateVersions(room)
 	if err != nil {
 		return 0, err
@@ -688,6 +772,9 @@ func (f *FilePersistence) SaveSnapshot(ctx context.Context, room, label string, 
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if err := f.aliveLocked(room); err != nil {
+		return 0, err
+	}
 	if err := os.MkdirAll(f.snapVersionsDir(room), 0o755); err != nil {
 		return 0, err
 	}
@@ -716,6 +803,11 @@ func (f *FilePersistence) ListSnapshots(ctx context.Context, room string) ([]Sna
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if _, tomb, err := f.readTombstoneGen(room); err != nil {
+		return nil, err
+	} else if tomb {
+		return []SnapshotInfo{}, nil
+	}
 	entries, err := os.ReadDir(f.snapVersionsDir(room))
 	if errors.Is(err, os.ErrNotExist) {
 		return []SnapshotInfo{}, nil
@@ -754,6 +846,11 @@ func (f *FilePersistence) GetSnapshotState(ctx context.Context, room string, id 
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if _, tomb, err := f.readTombstoneGen(room); err != nil {
+		return nil, err
+	} else if tomb {
+		return nil, ErrSnapshotNotFound
+	}
 	b, err := os.ReadFile(f.snapVersionPath(room, id))
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, ErrSnapshotNotFound
@@ -807,7 +904,126 @@ func (f *FilePersistence) ListRooms(ctx context.Context) ([]string, error) {
 		if derr != nil {
 			continue
 		}
+		// A room deleted via DeleteRoom leaves a directory holding only the
+		// tombstone marker; it is gone until an explicit ResetRoom.
+		if _, err := os.Stat(filepath.Join(f.root, e.Name(), "tombstone")); err == nil {
+			continue
+		}
 		out = append(out, string(raw))
 	}
 	return out, nil
+}
+
+// DeleteRoom permanently wipes the room directory and writes the generation
+// tombstone. See RoomTombstoneStore.
+func (f *FilePersistence) DeleteRoom(ctx context.Context, room string) (uint64, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	gen, tomb, err := f.readTombstoneGen(room)
+	if err != nil {
+		return 0, err
+	}
+	if tomb {
+		return gen, nil // same deletion resubmitted: idempotent
+	}
+	gen++
+	if gen < 1 {
+		gen = 1
+	}
+	if err := f.writeTombstone(room, gen); err != nil {
+		return 0, err
+	}
+	return gen, nil
+}
+
+// MarkRoomDeleted records a remotely-originated deletion at AT LEAST
+// generation. See RoomTombstoneStore.
+func (f *FilePersistence) MarkRoomDeleted(ctx context.Context, room string, generation uint64) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if generation < 1 {
+		generation = 1
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	gen, tomb, err := f.readTombstoneGen(room)
+	if err != nil {
+		return err
+	}
+	if tomb && gen >= generation {
+		return nil // stale or duplicate deletion event
+	}
+	if generation < gen {
+		generation = gen
+	}
+	return f.writeTombstone(room, generation)
+}
+
+// RoomGeneration reports the recorded generation and tombstoned flag.
+func (f *FilePersistence) RoomGeneration(ctx context.Context, room string) (uint64, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, false, err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.readTombstoneGen(room)
+}
+
+// ResetRoom removes the whole room directory (data and tombstone) and returns
+// the superseded generation + 1. See RoomTombstoneStore.
+func (f *FilePersistence) ResetRoom(ctx context.Context, room string) (uint64, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	gen, tomb, err := f.readTombstoneGen(room)
+	if err != nil {
+		return 0, err
+	}
+	if _, statErr := os.Stat(f.roomDir(room)); statErr != nil {
+		if errors.Is(statErr, os.ErrNotExist) {
+			return 0, nil // the store has never heard of this room
+		}
+		return 0, statErr
+	}
+	if !tomb {
+		gen = 0 // live data with no deletion still yields a new generation
+	}
+	gen++
+	if err := os.RemoveAll(f.roomDir(room)); err != nil {
+		return 0, err
+	}
+	return gen, nil
+}
+
+// MarkRoomReset applies a remotely-originated reset, ignoring stale events.
+// See RoomTombstoneStore.
+func (f *FilePersistence) MarkRoomReset(ctx context.Context, room string, generation uint64) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if generation < 1 {
+		generation = 1
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	gen, tomb, err := f.readTombstoneGen(room)
+	if err != nil {
+		return err
+	}
+	if tomb && gen >= generation {
+		return nil // a newer-or-equal deletion supersedes this reset
+	}
+	if _, statErr := os.Stat(f.roomDir(room)); statErr != nil {
+		if errors.Is(statErr, os.ErrNotExist) {
+			return nil
+		}
+		return statErr
+	}
+	return os.RemoveAll(f.roomDir(room))
 }

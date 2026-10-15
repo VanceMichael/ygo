@@ -43,7 +43,33 @@ type memRoom struct {
 	// monotonic and never rewound, so an id is not reused after a delete.
 	snapVersions []labelledSnapshot
 	nextSnapID   int64
+
+	// tombstoned marks a room permanently deleted (RoomTombstoneStore): every
+	// other field is empty while true, Load returns ErrRoomDeleted, and every
+	// mutating call is refused until ResetRoom removes the entry. tombGen is
+	// the generation recorded for that deletion (or, after a reset has wiped
+	// the entry and a later delete created it afresh, the new generation).
+	tombstoned bool
+	tombGen    uint64
 }
+
+// wipeLocked resets every data-bearing field of the room to empty without
+// touching the tombstone bookkeeping (callers set tombGen/tombstoned
+// themselves, in the same critical section). Must be called with m.mu held.
+func (r *memRoom) wipeLocked() {
+	r.records = nil
+	r.nextVer = 1
+	r.snapshots = make(map[string]snapshot)
+	r.checkpoint = 0
+	r.checkpointSet = false
+	r.rolledBack = nil
+	r.snapVersions = nil
+	r.nextSnapID = 1
+}
+
+// aliveLocked reports whether the room may be read as live data or mutated.
+// Must be called with m.mu held.
+func (r *memRoom) aliveLocked() bool { return !r.tombstoned }
 
 type snapshot struct {
 	state   []byte
@@ -121,6 +147,9 @@ func (m *MemoryPersistence) Load(ctx context.Context, room string) (LoadResult, 
 	if !ok {
 		return LoadResult{}, nil
 	}
+	if !r.aliveLocked() {
+		return LoadResult{}, ErrRoomDeleted
+	}
 	return materializeLocked(r, r.checkpointOrMaxVisible())
 }
 
@@ -179,6 +208,9 @@ func (m *MemoryPersistence) AppendUpdate(ctx context.Context, room string, updat
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	r := m.getRoom(room)
+	if !r.aliveLocked() {
+		return 0, ErrRoomDeleted
+	}
 
 	// Crash recovery: a PruneAfter that crashed after writing its checkpoint but
 	// before its deletes leaves checkpointSet=true with stale records>checkpoint
@@ -215,7 +247,7 @@ func (m *MemoryPersistence) ListVersions(ctx context.Context, room string) ([]Ve
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	r, ok := m.rooms[room]
-	if !ok {
+	if !ok || !r.aliveLocked() {
 		return nil, nil
 	}
 	recs := r.visibleRecords()
@@ -234,7 +266,7 @@ func (m *MemoryPersistence) GetUpdate(ctx context.Context, room string, v Versio
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	r, ok := m.rooms[room]
-	if !ok {
+	if !ok || !r.aliveLocked() {
 		return nil, VersionMeta{}, false, nil
 	}
 	for _, rec := range r.visibleRecords() {
@@ -260,6 +292,9 @@ func (m *MemoryPersistence) MaterializeAt(ctx context.Context, room string, v Ve
 	if !ok {
 		return nil, ErrRoomNotFound
 	}
+	if !r.aliveLocked() {
+		return nil, ErrRoomDeleted
+	}
 	res, err := materializeLocked(r, v)
 	if err != nil {
 		return nil, err
@@ -275,6 +310,9 @@ func (m *MemoryPersistence) CaptureSnapshot(ctx context.Context, room, name stri
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	r := m.getRoom(room)
+	if !r.aliveLocked() {
+		return 0, ErrRoomDeleted
+	}
 	v := r.checkpointOrMaxVisible()
 	r.snapshots[name] = snapshot{state: append([]byte(nil), state...), version: v}
 	return v, nil
@@ -288,7 +326,7 @@ func (m *MemoryPersistence) RestoreSnapshot(ctx context.Context, room, name stri
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	r, ok := m.rooms[room]
-	if !ok {
+	if !ok || !r.aliveLocked() {
 		return nil, 0, false, nil
 	}
 	snap, ok := r.snapshots[name]
@@ -318,6 +356,9 @@ func (m *MemoryPersistence) PruneAfter(ctx context.Context, room string, target 
 	r, ok := m.rooms[room]
 	if !ok {
 		return ErrRoomNotFound
+	}
+	if !r.aliveLocked() {
+		return ErrRoomDeleted
 	}
 
 	// Step 1: persist checkpoint + rolled-back head. From this instant the
@@ -372,6 +413,9 @@ func (m *MemoryPersistence) Compact(ctx context.Context, room string, keep int) 
 	if !ok {
 		return 0, nil
 	}
+	if !r.aliveLocked() {
+		return 0, ErrRoomDeleted
+	}
 	recs := r.visibleRecords()
 	if len(recs) <= keep {
 		return 0, nil
@@ -424,6 +468,9 @@ func (m *MemoryPersistence) SaveSnapshot(ctx context.Context, room, label string
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	r := m.getRoom(room)
+	if !r.aliveLocked() {
+		return 0, ErrRoomDeleted
+	}
 	id := r.nextSnapID
 	r.nextSnapID++
 	r.snapVersions = append(r.snapVersions, labelledSnapshot{
@@ -443,7 +490,7 @@ func (m *MemoryPersistence) ListSnapshots(ctx context.Context, room string) ([]S
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	r, ok := m.rooms[room]
-	if !ok {
+	if !ok || !r.aliveLocked() {
 		return []SnapshotInfo{}, nil
 	}
 	out := make([]SnapshotInfo, 0, len(r.snapVersions))
@@ -467,7 +514,7 @@ func (m *MemoryPersistence) GetSnapshotState(ctx context.Context, room string, i
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	r, ok := m.rooms[room]
-	if !ok {
+	if !ok || !r.aliveLocked() {
 		return nil, ErrSnapshotNotFound
 	}
 	for _, s := range r.snapVersions {
@@ -507,6 +554,11 @@ func (m *MemoryPersistence) ListRooms(ctx context.Context) ([]string, error) {
 	defer m.mu.Unlock()
 	out := make([]string, 0, len(m.rooms))
 	for name, r := range m.rooms {
+		// A tombstone-only entry holds no live data and must not be enumerated:
+		// a deleted room is gone until an explicit ResetRoom.
+		if !r.aliveLocked() {
+			continue
+		}
 		// Skip a room whose entry exists but holds nothing (e.g. pruned to empty):
 		// the contract is "has persisted data", not "was ever touched".
 		if len(r.records) == 0 && len(r.snapshots) == 0 && len(r.snapVersions) == 0 {
@@ -515,4 +567,102 @@ func (m *MemoryPersistence) ListRooms(ctx context.Context) ([]string, error) {
 		out = append(out, name)
 	}
 	return out, nil
+}
+
+// DeleteRoom permanently wipes the room and records a deletion tombstone at
+// the next generation. See RoomTombstoneStore.
+func (m *MemoryPersistence) DeleteRoom(ctx context.Context, room string) (uint64, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	r := m.getRoom(room)
+	if r.tombstoned {
+		// Same deletion resubmitted: idempotent, same generation.
+		return r.tombGen, nil
+	}
+	r.wipeLocked()
+	r.tombGen++
+	r.tombstoned = true
+	return r.tombGen, nil
+}
+
+// MarkRoomDeleted records a remotely-originated deletion at AT LEAST
+// generation, wiping the room. See RoomTombstoneStore.
+func (m *MemoryPersistence) MarkRoomDeleted(ctx context.Context, room string, generation uint64) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if generation < 1 {
+		generation = 1
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	r := m.getRoom(room)
+	if r.tombstoned && r.tombGen >= generation {
+		return nil // stale or duplicate of the same deletion
+	}
+	r.wipeLocked()
+	if generation > r.tombGen {
+		r.tombGen = generation
+	}
+	if r.tombGen < 1 {
+		r.tombGen = 1
+	}
+	r.tombstoned = true
+	return nil
+}
+
+// RoomGeneration reports the recorded generation and the tombstoned flag.
+func (m *MemoryPersistence) RoomGeneration(ctx context.Context, room string) (uint64, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, false, err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	r, ok := m.rooms[room]
+	if !ok {
+		return 0, false, nil
+	}
+	return r.tombGen, r.tombstoned, nil
+}
+
+// ResetRoom removes every trace of the room, including its tombstone, and
+// returns the new (superseded + 1) generation. See RoomTombstoneStore.
+func (m *MemoryPersistence) ResetRoom(ctx context.Context, room string) (uint64, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	r, ok := m.rooms[room]
+	if !ok {
+		return 0, nil // nothing known under this name
+	}
+	gen := r.tombGen + 1
+	if gen < 1 {
+		gen = 1
+	}
+	delete(m.rooms, room)
+	return gen, nil
+}
+
+// MarkRoomReset applies a remotely-originated reset, ignoring stale events.
+// See RoomTombstoneStore.
+func (m *MemoryPersistence) MarkRoomReset(ctx context.Context, room string, generation uint64) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if generation < 1 {
+		generation = 1
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	r, ok := m.rooms[room]
+	if ok && r.tombGen >= generation {
+		return nil // a newer-or-equal deletion supersedes this reset
+	}
+	delete(m.rooms, room)
+	return nil
 }

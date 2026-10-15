@@ -112,6 +112,60 @@ func (a *LegacyAdapter) Store() VersionedPersistence {
 	return a.store
 }
 
+// tombstones returns the wrapped store when it implements the optional
+// RoomTombstoneStore extension.
+func (a *LegacyAdapter) tombstones() (RoomTombstoneStore, bool) {
+	ts, ok := a.store.(RoomTombstoneStore)
+	return ts, ok
+}
+
+// DeleteRoom satisfies the provider's optional room-deletion extension by
+// forwarding to the wrapped store. Returns ErrTombstonesUnsupported when the
+// backing store cannot record a generation tombstone.
+func (a *LegacyAdapter) DeleteRoom(ctx context.Context, room string) (uint64, error) {
+	ts, ok := a.tombstones()
+	if !ok {
+		return 0, ErrTombstonesUnsupported
+	}
+	return ts.DeleteRoom(ctx, room)
+}
+
+// MarkRoomDeleted forwards a remotely-originated deletion.
+func (a *LegacyAdapter) MarkRoomDeleted(ctx context.Context, room string, generation uint64) error {
+	ts, ok := a.tombstones()
+	if !ok {
+		return ErrTombstonesUnsupported
+	}
+	return ts.MarkRoomDeleted(ctx, room, generation)
+}
+
+// RoomGeneration forwards the tombstone lookup.
+func (a *LegacyAdapter) RoomGeneration(ctx context.Context, room string) (uint64, bool, error) {
+	ts, ok := a.tombstones()
+	if !ok {
+		return 0, false, ErrTombstonesUnsupported
+	}
+	return ts.RoomGeneration(ctx, room)
+}
+
+// ResetRoom forwards the explicit new-generation action.
+func (a *LegacyAdapter) ResetRoom(ctx context.Context, room string) (uint64, error) {
+	ts, ok := a.tombstones()
+	if !ok {
+		return 0, ErrTombstonesUnsupported
+	}
+	return ts.ResetRoom(ctx, room)
+}
+
+// MarkRoomReset forwards a remotely-originated reset.
+func (a *LegacyAdapter) MarkRoomReset(ctx context.Context, room string, generation uint64) error {
+	ts, ok := a.tombstones()
+	if !ok {
+		return ErrTombstonesUnsupported
+	}
+	return ts.MarkRoomReset(ctx, room, generation)
+}
+
 // SaveVersion satisfies the provider's optional VersionableAdapter interface. It
 // materializes the room's current head and records it as a labelled snapshot via
 // the wrapped store's SnapshotStore, then applies KeepSnapshots retention.

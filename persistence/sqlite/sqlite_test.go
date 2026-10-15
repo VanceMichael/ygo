@@ -293,6 +293,19 @@ func TestConformance_SQLite(t *testing.T) {
 	})
 }
 
+func TestTombstoneConformance_SQLite(t *testing.T) {
+	dir := t.TempDir()
+	n := 0
+	persistence.RunTombstoneConformance(t, func() persistence.TombstoneConformanceStore {
+		n++
+		s, err := sqlite.Open(filepath.Join(dir, fmt.Sprintf("tomb-%d.db", n)))
+		if err != nil {
+			t.Fatalf("Open: %v", err)
+		}
+		return s
+	})
+}
+
 // Decoded without the state it was made against, an incremental update parks
 // every item that depends on that state. AppendUpdate checks an update by
 // decoding it alone, so it must keep such an update however many items it

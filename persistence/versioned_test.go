@@ -44,6 +44,22 @@ func TestSnapshotStoreConformance_File(t *testing.T) {
 	})
 }
 
+func TestTombstoneConformance_Memory(t *testing.T) {
+	persistence.RunTombstoneConformance(t, func() persistence.TombstoneConformanceStore {
+		return persistence.NewMemoryPersistence()
+	})
+}
+
+func TestTombstoneConformance_File(t *testing.T) {
+	persistence.RunTombstoneConformance(t, func() persistence.TombstoneConformanceStore {
+		p, err := persistence.NewFilePersistence(t.TempDir())
+		if err != nil {
+			t.Fatalf("NewFilePersistence: %v", err)
+		}
+		return p
+	})
+}
+
 func TestRoomListerConformance_Memory(t *testing.T) {
 	persistence.RunRoomListerConformance(t, func() persistence.SnapshotVersionedPersistence {
 		return persistence.NewMemoryPersistence()

@@ -135,6 +135,26 @@ const DefaultChannelSize = 1024
 // across any plausible cluster size but keeps the wire framing tidy.
 const nodeIDLen = 16
 
+// controlSuffix is appended to ChannelPrefix to name the single CLUSTER-WIDE
+// control channel carrying room lifecycle events (cluster.KindDelete /
+// cluster.KindReset). It MUST be a name no room channel can have: room names
+// pass internal/roomname.Valid, which rejects every byte below 0x20, so a
+// leading NUL byte is an impossible room suffix. Every started node subscribes
+// to this channel regardless of which rooms it activated — a delete must
+// reach a node that holds only a durable tombstone or relay-side per-room
+// state (a worker, a stream reader), not only nodes currently serving the
+// room. The same NUL also keeps the key clear of the Streams keyspace
+// ("s:"/"a:" discriminators).
+const controlSuffix = "\x00control"
+
+// controlBuffer bounds how many lifecycle events the subscriber may queue for
+// the single control goroutine. Lifecycle events are tiny, rare and
+// never coalesced (one delete generation must not absorb another), but a slow
+// Sink must not be able to block the shared subscriber either; a full queue
+// drops and counts via routerDrops, the same degraded-but-visible class as a
+// missed room worker.
+const controlBuffer = 256
+
 // Errors returned by the relay. Callers should compare with errors.Is.
 var (
 	// ErrRelayClosed is returned by Publish / Start after Close.
@@ -400,6 +420,12 @@ type Relay struct {
 	// channel back-pressures the caller, matching MemRelay.
 	outbound chan cluster.Outbound
 
+	// controlCh carries room lifecycle events (KindDelete/KindReset) from the
+	// subscriber (and from lifecycle messages that arrive on a per-room
+	// channel during mixed-version routing) to the single runControl goroutine,
+	// which hands them to Sink.Inject and cleans this relay's per-room state.
+	controlCh chan cluster.Inbound
+
 	// done is closed once by Close to signal all goroutines to exit.
 	done chan struct{}
 
@@ -525,6 +551,7 @@ func New(client *goredis.Client, cfg Config) (*Relay, error) {
 		chanSize:    cfg.ChannelSize,
 		scfg:        scfg,
 		outbound:    make(chan cluster.Outbound, cfg.OutboundBuffer),
+		controlCh:   make(chan cluster.Inbound, controlBuffer),
 		done:        make(chan struct{}),
 		activeRooms: make(map[string]int),
 		laneCap:     cfg.RoomQueueSize,
@@ -539,6 +566,12 @@ func New(client *goredis.Client, cfg Config) (*Relay, error) {
 // channelFor returns the Redis channel name for a given room.
 func (r *Relay) channelFor(room string) string {
 	return r.prefix + room
+}
+
+// controlChannel returns the cluster-wide lifecycle channel. See
+// controlSuffix for why the NUL cannot appear in a room channel name.
+func (r *Relay) controlChannel() string {
+	return r.prefix + controlSuffix
 }
 
 // NodeID returns a copy of this relay's nodeID. Exposed for diagnostic /
@@ -650,9 +683,20 @@ func (r *Relay) Start(ctx context.Context, sink cluster.Sink) error {
 	r.startCtx = ctx
 	r.pubSub = r.client.Subscribe(ctx)
 
-	r.wg.Add(2)
+	// Cluster-wide control channel for room lifecycle events. Subscribed up
+	// front (not on RoomActivated): a delete must reach every node even when
+	// it never activated the room — it may still need to record the durable
+	// tombstone or drop relay-side per-room state. The bound start ctx lets
+	// an unreachable Redis unwind Shutdown like the per-room SUBSCRIBEs.
+	if err := r.pubSub.Subscribe(ctx, r.controlChannel()); err != nil {
+		_ = r.pubSub.Close()
+		return err
+	}
+
+	r.wg.Add(3)
 	go r.runSubscriber(ctx)
 	go r.runPublisher(ctx)
+	go r.runControl(ctx)
 
 	// Streams-tier readers, gated on the transport so PubSub mode — the zero
 	// value, and every existing caller — launches nothing new. They get a
@@ -742,6 +786,32 @@ func (r *Relay) runSubscriber(ctx context.Context) {
 			if bytes.Equal(srcNodeID, r.nodeID) {
 				continue
 			}
+			// Lifecycle events are control-plane traffic: they travel on the
+			// cluster-wide control channel (a lifecycle kind arriving on a
+			// per-room channel — a mixed-version cluster — is routed the same
+			// way) and MUST NOT go through a per-room worker lane: a delete
+			// must reach a node that never activated the room, and must never
+			// be coalesced as "another KindSync blob". runControl applies them
+			// via Sink.Inject and cleans relay-side per-room state.
+			if cluster.IsLifecycle(kind) {
+				in := cluster.Inbound{Room: room, Kind: kind, Data: data}
+				select {
+				case r.controlCh <- in:
+				case <-r.done:
+					return
+				case <-ctx.Done():
+					return
+				default:
+					// A wedged control Sink must not stall the shared
+					// subscriber. Visible via RouterDrops, like a room-worker
+					// miss; the admin caller's own generation stays durably
+					// tombstoned and a retried delete converges.
+					r.routerDrops.Add(1)
+					r.log.Warn("cluster/redis: lifecycle event queue full; dropped",
+						"room", room, "kind", kind)
+				}
+				continue
+			}
 			// H3: reject a kind outside the known set before it ever reaches
 			// Push. Lane.Push has exactly two buckets — KindAwareness, and
 			// "everything else" filed as KindSync — so an unrecognised kind
@@ -756,7 +826,7 @@ func (r *Relay) runSubscriber(ctx context.Context) {
 			// just this one. Checked against the known set explicitly
 			// (KindSync/KindAwareness), not e.g. `kind > 1`, so this stays
 			// correct without a code change if cluster.Kind ever grows a
-			// third value: an old node must still ignore it, not guess.
+			// data-plane value: an old node must still ignore it, not guess.
 			switch kind {
 			case cluster.KindSync, cluster.KindAwareness:
 				// known kind, proceed
@@ -807,6 +877,16 @@ func (r *Relay) Publish(ctx context.Context, out cluster.Outbound) error {
 	}
 	if err := ctx.Err(); err != nil {
 		return err
+	}
+
+	// Room lifecycle events bypass both per-room tiers: they are published
+	// SYNCHRONOUSLY to the cluster-wide control channel (so the admin caller
+	// receives a decidable error instead of the async publisher's swallowed
+	// one) and never XADD'd to a room stream. KindDelete additionally removes
+	// the room's durable stream keys in Streams/Both mode, so a node that
+	// restarts cannot replay deleted updates from the stream tier.
+	if cluster.IsLifecycle(out.Kind) {
+		return r.publishLifecycle(ctx, out)
 	}
 
 	if r.scfg.transport.usesStreams() {

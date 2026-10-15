@@ -701,6 +701,37 @@ type room struct {
 	// where a lone creator's pre-registration failure reaps a room a
 	// concurrent joiner is still in the process of joining.
 	inflight int
+
+	// retired is set the moment a DeleteRoom/ResetRoom lifecycle operation
+	// installs its generation barrier. Every inbound path re-checks it: the
+	// peer read loop drops late sync/awareness frames, getOrCreateRoom's
+	// post-load waiters refuse the room, and no new peer can register (the
+	// instance is already gone from s.rooms). The room's own teardown is
+	// serialised through retireMu/retireDone so an interrupted (ctx-expired)
+	// deletion converges when the admin retries.
+	retired atomic.Bool
+	retireMu     sync.Mutex
+	retireDone   chan struct{} // closed exactly once, after the full ordered teardown
+
+	// Persistence-obscriber in-flight tracking. The doc.OnUpdate observer
+	// registered in loadRoom is the last path by which a write from a cached
+	// *crdt.Doc could reach storage AFTER DeleteRoom wiped it. obsDone is set
+	// when the observer is unsubscribed; observers that already entered drain
+	// to zero before the storage wipe, and observers entering later no-op.
+	obsMu   sync.Mutex
+	obsN    int
+	obsZero chan struct{}
+	obsDone bool
+	// persistUnsub detaches the persistence OnUpdate observer at retirement.
+	persistUnsub func()
+}
+
+// roomGeneration is one entry of Server.graves: the highest lifecycle
+// generation observed for a room name and whether the name is currently
+// barred (deleted=true) or reopened as a new empty generation (deleted=false).
+type roomGeneration struct {
+	gen     uint64
+	deleted bool
 }
 
 // clearIdle marks the room as non-idle. Used by the immediate-mutation callers
@@ -731,6 +762,20 @@ type Server struct {
 	upgrader    gws.Upgrader
 	rmu         sync.RWMutex
 	rooms       map[string]*room
+	// graves records the most recent room LIFECYCLE generation per name
+	// (DeleteRoom / ResetRoom and their relay-delivered counterparts). An entry
+	// with deleted=true is the permanent-delete barrier: no new connection,
+	// Apply, BroadcastUpdate, or remote Inject may create or enter the room,
+	// and room creation consults the durable tombstone as well. An entry with
+	// deleted=false is a completed reset (a new, empty generation is open); it
+	// is retained only so a stale lower-generation delete event cannot
+	// re-tombstone the room. Guarded by rmu.
+	graves map[string]roomGeneration
+	// localGen mints generations for deployments with no durable generation
+	// store (no persistence adapter). Monotonic per Server; guarded by rmu.
+	// Deployments with a RoomTombstoneStore get the store-authoritative
+	// generation instead, which converges cluster-wide.
+	localGen uint64
 	persistence PersistenceAdapter
 
 	// relay, when non-nil, mirrors local doc/awareness changes to other server
@@ -1327,6 +1372,7 @@ func (s *Server) newPeerLimiter() *rate.Limiter {
 func NewServer() *Server {
 	s := &Server{
 		rooms:        make(map[string]*room),
+		graves:       make(map[string]roomGeneration),
 		shutdownCh:   make(chan struct{}),
 		sweeperDone:  make(chan struct{}),
 		strandedZero: make(chan struct{}),
@@ -1584,9 +1630,11 @@ func (s *Server) getOrCreateRoom(ctx context.Context, name string) (*room, bool,
 		// This goroutine owns the load. It runs with s.rmu released; other
 		// callers (same or different room) never block on it via s.rmu.
 		s.loadRoom(ctx, r, name)
-		if r.loadErr == nil && s.relay != nil {
+		if r.loadErr == nil && s.relay != nil && !r.retired.Load() {
 			// Off-lock and post-ready: a re-entrant Sink.Inject from RoomActivated
 			// finds the published room and waits on the already-closed ready.
+			// Skipped when a DeleteRoom retired the instance mid-load: the
+			// deletion teardown performs its own RoomDeactivated.
 			s.relay.RoomActivated(name)
 		}
 	} else {
@@ -1595,6 +1643,15 @@ func (s *Server) getOrCreateRoom(ctx context.Context, name string) (*room, bool,
 	}
 	if r.loadErr != nil {
 		return nil, false, r.loadErr
+	}
+	// A DeleteRoom/ResetRoom can install its barrier while the load (or the
+	// ready wait above) was in progress. The instance is then already out of
+	// s.rooms and on its teardown path; refuse it and balance the inflight the
+	// placeholder creation counted, so the retiring teardown's inflight drain
+	// cannot wait on a caller that would never register a peer.
+	if r.retired.Load() {
+		s.releaseInflight(r)
+		return nil, false, ErrRoomDeleted
 	}
 
 	// #183 (G4): start the idle-room sweeper lazily on first room creation when
@@ -1634,6 +1691,15 @@ func (s *Server) getOrCreateRoom(ctx context.Context, name string) (*room, bool,
 func (s *Server) createRoomPlaceholder(name string) (*room, bool, error) {
 	s.rmu.Lock()
 	defer s.rmu.Unlock()
+	// Permanent-delete barrier: a tombstoned name cannot be recreated, by this
+	// or ANY other path (peer upgrade, Apply, BroadcastUpdate, relay Inject),
+	// until an administrator opens a new generation (ResetRoom). The durable
+	// counterpart in the persistence layer makes this survive restarts; the
+	// store-side check in loadRoomDoc closes the window in which this node has
+	// never seen the cluster's delete event.
+	if g, ok := s.graves[name]; ok && g.deleted {
+		return nil, false, ErrRoomDeleted
+	}
 	if r, ok := s.rooms[name]; ok {
 		// Increment inflight under s.rmu (which we still hold) so a concurrent
 		// evictIdleRoom — which also takes s.rmu — cannot interleave between this
@@ -1668,6 +1734,7 @@ func (s *Server) createRoomPlaceholder(name string) (*room, bool, error) {
 		awareness: aw,
 		peers:     make(map[*peer]struct{}),
 		ready:     make(chan struct{}),
+		obsZero:   make(chan struct{}),
 	}
 	if s.MaxPeersPerRoom > 0 {
 		r.peerSem = semaphore.NewWeighted(int64(s.MaxPeersPerRoom))
@@ -1748,7 +1815,16 @@ func (s *Server) loadRoom(ctx context.Context, r *room, name string) {
 		r.persistRetire = make(chan struct{})
 		r.flushReq = make(chan chan bool)
 		s.startPersistenceWorker(r, name)
-		r.doc.OnUpdate(func(update []byte, _ any) {
+		r.persistUnsub = r.doc.OnUpdate(func(update []byte, _ any) {
+			// The lifecycle guard pairs with DeleteRoom's teardown: once the
+			// observer is detached (obsDone), a commit from a cached *crdt.Doc
+			// must not reach storage AFTER the permanent delete wiped it. An
+			// observer that entered before obsDone drains to zero before that
+			// wipe runs; one entering after is a no-op.
+			if !r.observerEnter() {
+				return
+			}
+			defer r.observerLeave()
 			// #229 — handing the update to persistCh is only safe while the
 			// worker is still reading it. The worker publishes its retirement
 			// by closing persistRetire BEFORE its final drain, which gives this
@@ -1821,9 +1897,32 @@ func (s *Server) loadRoomDoc(r *room, name string) (loadErr error) {
 			loadErr = fmt.Errorf("LoadDoc panic for room %q: %v", name, rv)
 		}
 	}()
+	// Durable generation barrier: a room another node (or an earlier process)
+	// permanently deleted must fail to load even when THIS node has no grave
+	// entry for it yet — otherwise LoadDoc's (nil,nil) "empty room" result
+	// would bootstrap a fresh doc over the tombstone and resurrect the name.
+	// The recorded generation is installed as this node's grave so later
+	// in-memory checks and an incoming relay event agree on the generation.
+	if ts, ok := s.persistence.(roomGenerationStore); ok {
+		gen, deleted, err := ts.RoomGeneration(context.Background(), name)
+		if err != nil {
+			return fmt.Errorf("loading room %q: %w", name, err)
+		}
+		if deleted {
+			s.noteTombstone(name, gen)
+			return ErrRoomDeleted
+		}
+	}
 	data, err := s.persistence.LoadDoc(name)
 	switch {
 	case err != nil:
+		if errors.Is(err, persistence.ErrRoomDeleted) {
+			// Store refused a load over its tombstone even though the
+			// RoomGeneration fast path above did not report one (or the
+			// adapter does not expose generations). Record the barrier.
+			s.noteTombstone(name, 0)
+			return ErrRoomDeleted
+		}
 		return fmt.Errorf("loading room %q: %w", name, err)
 	case len(data) > 0:
 		if err := crdt.ApplyUpdateV1(r.doc, data, nil); err != nil {
@@ -1831,6 +1930,21 @@ func (s *Server) loadRoomDoc(r *room, name string) (loadErr error) {
 		}
 	}
 	return nil
+}
+
+// noteTombstone installs (or raises) the in-memory deleted grave for name under
+// s.rmu. A gen of 0 records the barrier without a known generation; a later
+// event or store call fills in the real one. Never lowers a recorded
+// generation, so it cannot clobber a newer delete/reset observed meanwhile.
+func (s *Server) noteTombstone(name string, gen uint64) {
+	s.rmu.Lock()
+	defer s.rmu.Unlock()
+	cur, ok := s.graves[name]
+	if !ok || gen > cur.gen {
+		cur.gen = gen
+	}
+	cur.deleted = true
+	s.graves[name] = cur
 }
 
 // failRoomLoad is the single failure path shared by every loadRoom failure
@@ -1885,12 +1999,20 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	rm, created, err := s.getOrCreateRoom(r.Context(), name)
 	if err != nil {
-		if errors.Is(err, ErrTooManyRooms) {
+		switch {
+		case errors.Is(err, ErrRoomDeleted):
+			// Permanent deletion (or a durable tombstone from another node):
+			// 410 Gone, distinct from the transient 500 a failed room load
+			// gives. The name stays refused until an admin ResetRoom.
+			http.Error(w, "room deleted", http.StatusGone)
+			return
+		case errors.Is(err, ErrTooManyRooms):
 			http.Error(w, "too many rooms", http.StatusServiceUnavailable)
 			return
+		default:
+			http.Error(w, "room unavailable", http.StatusInternalServerError)
+			return
 		}
-		http.Error(w, "room unavailable", http.StatusInternalServerError)
-		return
 	}
 
 	// Enforce per-room and server-wide connection limits before upgrading so

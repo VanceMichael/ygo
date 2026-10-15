@@ -49,6 +49,15 @@ type peer struct {
 
 // handleMessage decodes the outer message type and dispatches accordingly.
 func (p *peer) handleMessage(data []byte) {
+	// Lifecycle barrier: once DeleteRoom/ResetRoom retired this room instance,
+	// every late frame — a sync or awareness update already read off the wire,
+	// a delayed stateless, anything — is dropped rather than applied. The
+	// connection is being closed by the teardown anyway; this only closes the
+	// window in which an in-flight read could still mutate the doc or
+	// awareness after the barrier went up (and after storage was wiped).
+	if p.room != nil && p.room.retired.Load() {
+		return
+	}
 	dec := encoding.NewDecoder(data)
 	if p.hocuspocusFraming {
 		docName, err := dec.ReadVarString()
