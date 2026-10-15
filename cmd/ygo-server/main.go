@@ -31,9 +31,31 @@
 //	                    applied on capture, so it needs -version-interval
 //	                    (0 = keep all)
 //
+// # Maintenance commands
+//
+// "backup" and "restore" perform ONE storage operation and exit: they never
+// bind a listener, start the websocket server, or attach a Relay. Use them
+// (rather than copying the database file while its WAL is live) when migrating
+// a collaboration service or retaining data before maintenance.
+//
+//	ygo-server backup  -store DB -out FILE [-force] [-log text|json]
+//	ygo-server restore -in FILE -store DB [-force] [-log text|json]
+//
+// A backup reads every room from one consistent committed point and writes a
+// portable artifact carrying a format version and a SHA-256 integrity check
+// (visible update history and versions, name-keyed snapshots, enumerable
+// snapshots, and any in-progress-prune checkpoint). Restore validates the
+// ENTIRE artifact first, then builds the new database as a single
+// non-partially-visible operation: a non-empty -store is refused unless
+// -force is given, and corrupt input, an incompatible version, cancellation,
+// or a write/commit failure leaves the original database (and any existing
+// backup at the target name) untouched.
+//
 // The process serves until it receives SIGINT or SIGTERM, then shuts down
 // gracefully: it stops accepting connections, drains in-flight work, detaches
-// the relay (if any) and closes the persistence store.
+// the relay (if any) and closes the persistence store. The maintenance
+// commands take the same signals as a cancellation request and exit once the
+// single operation succeeds or aborts.
 package main
 
 import (
@@ -376,6 +398,19 @@ func main() { os.Exit(realMain(os.Args[1:])) }
 // process. Exit codes: 0 = clean (incl. -h/--help), 1 = runtime error,
 // 2 = bad command-line usage.
 func realMain(args []string) int {
+	// Maintenance subcommands perform one backup/restore operation and exit:
+	// they never start the server, bind a listener, or attach a Relay. The
+	// dispatch keys off the FIRST argument only (serve mode takes no
+	// positional arguments), so every existing flag invocation is untouched.
+	if len(args) > 0 {
+		switch args[0] {
+		case "backup":
+			return runBackupCmd(args[1:])
+		case "restore":
+			return runRestoreCmd(args[1:])
+		}
+	}
+
 	cfg, err := parseFlags(args)
 	if err != nil {
 		// -h/--help is an explicit request, not an error: flag already printed
